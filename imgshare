@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+"""imgshare — turn an image on a server into a link you can open in your local browser 🖼️
+
+Usage:
+  imgshare 1.png [2.jpg ...]   share images and print links (expire after 1 hour by default)
+  imgshare -t 10m 1.png        set the lifetime (s/m/h/d)
+  imgshare -l                  list active shares
+  imgshare -s                  stop the server and remove all shares
+
+Environment:
+  IMGSHARE_HOST   host name / public IP used in links (default: the address you SSHed to)
+  IMGSHARE_PORT   listen port (default 8000; open it in your firewall / security group)
+  IMGSHARE_BIND   listen address (default 0.0.0.0)
+
+Only files registered with imgshare and not yet expired can be accessed; each link
+carries a random token. The background server exits on its own when no shares remain.
+"""
+import fcntl
+import html
+import ipaddress
+import json
+import mimetypes
+import os
+import re
+import secrets
+import shutil
+import signal
+import socketserver
+import subprocess
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import quote, unquote
+
+STATE = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "imgshare")
+SHARES = os.path.join(STATE, "shares")
+PIDFILE = os.path.join(STATE, "server.pid")
+LOCKFILE = os.path.join(STATE, "lock")
+LOGFILE = os.path.join(STATE, "server.log")
+
+PORT = int(os.environ.get("IMGSHARE_PORT", "8000"))
+BIND = os.environ.get("IMGSHARE_BIND", "0.0.0.0")
+DEFAULT_TTL = 3600
+TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+
+
+# ---------- shared state ----------
+
+class Lock:
+    def __enter__(self):
+        os.makedirs(SHARES, exist_ok=True)
+        self.fd = open(LOCKFILE, "w")
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        fcntl.flock(self.fd, fcntl.LOCK_UN)
+        self.fd.close()
+
+
+def load_share(token):
+    if not TOKEN_RE.match(token):
+        return None
+    try:
+        with open(os.path.join(SHARES, token + ".json")) as f:
+            meta = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if meta.get("expires", 0) < time.time():
+        return None
+    return meta
+
+
+def all_shares():
+    out = {}
+    for fn in os.listdir(SHARES) if os.path.isdir(SHARES) else []:
+        if fn.endswith(".json"):
+            meta = load_share(fn[:-5])
+            if meta:
+                out[fn[:-5]] = meta
+    return out
+
+
+def purge_expired():
+    for fn in os.listdir(SHARES):
+        if fn.endswith(".json") and load_share(fn[:-5]) is None:
+            try:
+                os.remove(os.path.join(SHARES, fn))
+            except OSError:
+                pass
+
+
+def server_pid():
+    try:
+        with open(PIDFILE) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)
+        return pid
+    except (OSError, ValueError):
+        return None
+
+
+# ---------- HTTP server ----------
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "imgshare"
+    sys_version = ""
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write("%s %s %s\n" % (time.strftime("%F %T"), self.address_string(), fmt % args))
+
+    def do_HEAD(self):
+        self.do_GET(head=True)
+
+    def do_GET(self, head=False):
+        parts = self.path.split("?", 1)[0].strip("/").split("/")
+        meta = load_share(parts[0]) if parts and parts[0] else None
+        if meta is None:
+            return self.send_error(404)
+        token = parts[0]
+        if len(parts) == 1:
+            return self.gallery(token, meta, head)
+        if len(parts) != 2:
+            return self.send_error(404)
+        name = unquote(parts[1])
+        path = meta["files"].get(name)  # only registered names are served, so no path traversal
+        if not path or not os.path.isfile(path):
+            return self.send_error(404)
+        ctype = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        self.send_response(200)
+        self.common_headers(ctype, os.path.getsize(path))
+        self.send_header("Content-Disposition", "inline; filename*=UTF-8''" + quote(name))
+        self.end_headers()
+        if not head:
+            with open(path, "rb") as f:
+                shutil.copyfileobj(f, self.wfile)
+
+    def gallery(self, token, meta, head):
+        items = "\n".join(
+            '<figure><a href="{0}"><img src="{0}" loading="lazy"></a><figcaption>{1}</figcaption></figure>'.format(
+                "/%s/%s" % (token, quote(n)), html.escape(n))
+            for n in meta["files"])
+        body = ("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>"
+                "<title>imgshare</title><style>body{margin:16px;font:14px sans-serif;background:#111;color:#ddd}"
+                "figure{margin:0 0 24px}img{max-width:100%;display:block}</style>" + items).encode()
+        self.send_response(200)
+        self.common_headers("text/html; charset=utf-8", len(body))
+        self.end_headers()
+        if not head:
+            self.wfile.write(body)
+
+    def common_headers(self, ctype, length):
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(length))
+        self.send_header("Cache-Control", "private, no-store")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Robots-Tag", "noindex")
+
+
+class Server(socketserver.ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def serve():
+    httpd = Server((BIND, PORT), Handler)
+    with open(PIDFILE, "w") as f:
+        f.write(str(os.getpid()))
+
+    def reaper():
+        while True:
+            time.sleep(15)
+            with Lock():
+                purge_expired()
+                if not all_shares():
+                    try:
+                        os.remove(PIDFILE)
+                    except OSError:
+                        pass
+                    os._exit(0)  # exit while holding the lock so a new share can't race us
+
+    threading.Thread(target=reaper, daemon=True).start()
+    signal.signal(signal.SIGTERM, lambda *a: os._exit(0))
+    httpd.serve_forever()
+
+
+def start_server():
+    log = open(LOGFILE, "a")
+    subprocess.Popen([sys.executable, os.path.abspath(__file__), "--serve"],
+                     stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                     start_new_session=True)  # detach from the SSH session so links outlive the login
+    for _ in range(30):
+        time.sleep(0.1)
+        if server_pid():
+            return True
+    return False
+
+
+# ---------- command line ----------
+
+def public_host():
+    host = os.environ.get("IMGSHARE_HOST")
+    if host:
+        return host
+    conn = os.environ.get("SSH_CONNECTION", "").split()
+    host = conn[2] if len(conn) >= 3 else "127.0.0.1"
+    try:
+        ip = ipaddress.ip_address(host)
+        if ip.is_private or ip.is_loopback:
+            sys.stderr.write("⚠️  Detected address %s is private (common on cloud servers).\n"
+                             "   Set your public IP: export IMGSHARE_HOST=<public-ip> (e.g. in ~/.bashrc)\n" % host)
+        if ip.version == 6:
+            host = "[%s]" % host
+    except ValueError:
+        pass
+    return host
+
+
+def link(url):
+    # OSC 8 hyperlink: Ctrl+click it in terminals that support it
+    return "\033]8;;%s\033\\%s\033]8;;\033\\" % (url, url) if sys.stdout.isatty() else url
+
+
+def parse_ttl(s):
+    m = re.fullmatch(r"(\d+)([smhd]?)", s)
+    if not m:
+        sys.exit("Invalid lifetime: %s (e.g. 90s / 10m / 2h / 1d)" % s)
+    return int(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+
+
+def base_url():
+    return "http://%s:%d" % (public_host(), PORT)
+
+
+def share(paths, ttl):
+    files = {}
+    for p in paths:
+        if not os.path.isfile(p):
+            sys.exit("File not found: %s" % p)
+        name = os.path.basename(p)
+        stem, ext = os.path.splitext(name)
+        i = 1
+        while name in files:  # de-duplicate identical file names
+            name = "%s-%d%s" % (stem, i, ext)
+            i += 1
+        files[name] = os.path.realpath(p)
+
+    token = secrets.token_urlsafe(12)
+    with Lock():
+        purge_expired()
+        tmp = os.path.join(SHARES, token + ".tmp")
+        with open(tmp, "w") as f:
+            json.dump({"expires": time.time() + ttl, "files": files}, f)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, os.path.join(SHARES, token + ".json"))
+        if not server_pid() and not start_server():
+            os.remove(os.path.join(SHARES, token + ".json"))
+            tail = open(LOGFILE).read().strip().splitlines()[-1:] if os.path.exists(LOGFILE) else []
+            sys.exit("❌ Failed to start server (port %d in use?)%s" % (PORT, ("\n   " + tail[0]) if tail else ""))
+
+    base = base_url()
+    for name in files:
+        print(link("%s/%s/%s" % (base, token, quote(name))))
+    if len(files) > 1:
+        print("📚 All: " + link("%s/%s/" % (base, token)))
+    print("⏳ Expires at %s" % time.strftime("%H:%M", time.localtime(time.time() + ttl)), file=sys.stderr)
+
+
+def list_shares():
+    shares = all_shares()
+    if not shares:
+        return print("(no active shares)")
+    base = base_url()
+    for token, meta in sorted(shares.items(), key=lambda kv: kv[1]["expires"]):
+        print("⏳ Expires %s" % time.strftime("%m-%d %H:%M", time.localtime(meta["expires"])))
+        for name in meta["files"]:
+            print("   " + link("%s/%s/%s" % (base, token, quote(name))))
+
+
+def stop():
+    with Lock():
+        pid = server_pid()
+        if pid:
+            os.kill(pid, signal.SIGTERM)
+        shutil.rmtree(SHARES, ignore_errors=True)
+        try:
+            os.remove(PIDFILE)
+        except OSError:
+            pass
+    print("🛑 Server stopped and all shares removed")
+
+
+def main():
+    args = sys.argv[1:]
+    if args == ["--serve"]:
+        return serve()
+    if not args or args[0] in ("-h", "--help"):
+        return print(__doc__.strip())
+    if args == ["-l"]:
+        return list_shares()
+    if args == ["-s"]:
+        return stop()
+    ttl = DEFAULT_TTL
+    if args[0] == "-t":
+        if len(args) < 3:
+            sys.exit("Usage: imgshare -t 10m FILE...")
+        ttl, args = parse_ttl(args[1]), args[2:]
+    share(args, ttl)
+
+
+if __name__ == "__main__":
+    main()
