@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
-"""imgshare - turn an image on a server into a link you can open in your local browser
+"""imgshare - turn files on a server into links you can open in your local browser
 
 Usage:
-  imgshare 1.png [2.jpg ...]   share images and print links (expire after 1 hour by default)
-  imgshare -t 10m 1.png        set the lifetime (s/m/h/d)
-  imgshare -l                  list active shares
-  imgshare -s                  stop the server and remove all shares
+  imgshare 1.png [report.html ...]   share files and print links (expire after 1 hour by default)
+  imgshare ./site/                   share a directory (opens its index.html, or lists it)
+  imgshare -t 10m 1.png              set the lifetime (s/m/h/d)
+  imgshare -x ./site/                disable the HTML sandbox (for pages that need localStorage etc.)
+  imgshare -l                        list active shares
+  imgshare -s                        stop the server and remove all shares
+
+Images, HTML, PDF, audio and video open in the browser; text files (logs, source,
+Markdown, CSV, ...) are shown as plain text; anything else is downloaded.
+Video and audio support seeking (HTTP Range).
 
 Environment:
   IMGSHARE_HOST   host name / public IP used in links (default: the address you SSHed to)
@@ -13,7 +19,9 @@ Environment:
   IMGSHARE_BIND   listen address (default 0.0.0.0)
 
 Only files registered with imgshare and not yet expired can be accessed; each link
-carries a random token. The background server exits on its own when no shares remain.
+carries a random token. Dotfiles inside shared directories are never served.
+HTML and SVG run in a CSP sandbox (unique origin) unless -x is given.
+The background server exits on its own when no shares remain.
 """
 import fcntl
 import html
@@ -43,6 +51,18 @@ PORT = int(os.environ.get("IMGSHARE_PORT", "8000"))
 BIND = os.environ.get("IMGSHARE_BIND", "0.0.0.0")
 DEFAULT_TTL = 3600
 TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+
+# served with their own type so pages and their assets work
+KEEP_TYPES = {"text/html", "text/css", "text/javascript", "application/javascript",
+              "application/json", "application/manifest+json", "application/wasm",
+              "application/xml", "text/xml", "image/svg+xml"}
+SANDBOX_TYPES = {"text/html", "image/svg+xml"}
+SANDBOX_CSP = ("sandbox allow-scripts allow-forms allow-popups allow-modals "
+               "allow-downloads allow-popups-to-escape-sandbox")
+INLINE_PREFIXES = ("image/", "audio/", "video/", "text/")
+
+mimetypes.add_type("text/javascript", ".mjs")
+mimetypes.add_type("application/wasm", ".wasm")
 
 
 # ---------- shared state ----------
@@ -103,6 +123,62 @@ def server_pid():
 
 # ---------- HTTP server ----------
 
+def text_charset(path):
+    """None for binary files, "utf-8" for UTF-8 text, "" for text in another encoding."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read(8192)
+    except OSError:
+        return None
+    if b"\0" in data:
+        return None
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError as e:
+        if not (len(data) == 8192 and e.start >= len(data) - 3):  # tolerate a char cut at the end
+            return ""
+    return "utf-8"
+
+
+def content_type(path):
+    ctype = mimetypes.guess_type(path)[0]
+    if ctype in KEEP_TYPES or (ctype and ctype.startswith(("image/", "audio/", "video/", "font/"))) \
+            or ctype == "application/pdf":
+        return ctype
+    charset = text_charset(path)
+    if charset is not None:  # logs, source code, Markdown, CSV, ... -> show instead of download
+        return "text/plain; charset=utf-8" if charset else "text/plain"
+    return ctype or "application/octet-stream"
+
+
+def parse_range(header, size):
+    """Return (start, end) for a single byte range, None to send the whole file, or False if unsatisfiable."""
+    m = re.fullmatch(r"bytes=(\d*)-(\d*)", (header or "").strip())
+    if not m or m.group(1) == m.group(2) == "":
+        return None
+    if m.group(1) == "":
+        n = int(m.group(2))
+        if n == 0:
+            return False
+        return max(0, size - n), size - 1
+    start = int(m.group(1))
+    end = min(int(m.group(2)), size - 1) if m.group(2) else size - 1
+    if start >= size or start > end:
+        return False
+    return start, end
+
+
+def safe_parts(parts):
+    """Decode URL path segments; reject anything that could escape or expose dotfiles."""
+    out = []
+    for p in parts:
+        p = unquote(p)
+        if not p or p.startswith(".") or "/" in p or "\\" in p or "\0" in p:
+            return None
+        out.append(p)
+    return out
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "imgshare"
     sys_version = ""
@@ -114,47 +190,124 @@ class Handler(BaseHTTPRequestHandler):
         self.do_GET(head=True)
 
     def do_GET(self, head=False):
-        parts = self.path.split("?", 1)[0].strip("/").split("/")
-        meta = load_share(parts[0]) if parts and parts[0] else None
+        self.head = head
+        urlpath = self.path.split("?", 1)[0]
+        raw = urlpath.strip("/").split("/")
+        meta = load_share(raw[0]) if raw[0] else None
         if meta is None:
             return self.send_error(404)
-        token = parts[0]
-        if len(parts) == 1:
-            return self.gallery(token, meta, head)
-        if len(parts) != 2:
-            return self.send_error(404)
-        name = unquote(parts[1])
-        path = meta["files"].get(name)  # only registered names are served, so no path traversal
-        if not path or not os.path.isfile(path):
-            return self.send_error(404)
-        ctype = mimetypes.guess_type(name)[0] or "application/octet-stream"
-        self.send_response(200)
-        self.common_headers(ctype, os.path.getsize(path))
-        self.send_header("Content-Disposition", "inline; filename*=UTF-8''" + quote(name))
-        self.end_headers()
-        if not head:
-            with open(path, "rb") as f:
-                shutil.copyfileobj(f, self.wfile)
+        token = raw[0]
+        if len(raw) == 1:
+            return self.index_page("imgshare", [
+                (name, "/%s/%s%s" % (token, quote(name), "/" if os.path.isdir(p) else ""), p)
+                for name, p in meta["files"].items()])
 
-    def gallery(self, token, meta, head):
-        items = "\n".join(
-            '<figure><a href="{0}"><img src="{0}" loading="lazy"></a><figcaption>{1}</figcaption></figure>'.format(
-                "/%s/%s" % (token, quote(n)), html.escape(n))
-            for n in meta["files"])
+        parts = safe_parts(raw[1:])
+        if parts is None:
+            return self.send_error(404)
+        root = meta["files"].get(parts[0])  # only registered names are served
+        if root is None:
+            return self.send_error(404)
+        if os.path.isdir(root):
+            target = os.path.realpath(os.path.join(root, *parts[1:]))
+            if target != root and not target.startswith(root.rstrip(os.sep) + os.sep):
+                return self.send_error(404)  # symlink pointing outside the shared directory
+        elif len(parts) == 1:
+            target = root
+        else:
+            return self.send_error(404)
+
+        if os.path.isdir(target):
+            if not urlpath.endswith("/"):  # relative links in index.html need the trailing slash
+                self.send_response(301)
+                self.send_header("Location", urlpath + "/")
+                self.send_header("Content-Length", "0")
+                return self.end_headers()
+            index = os.path.join(target, "index.html")
+            if os.path.isfile(index):
+                return self.send_file(index, meta)
+            return self.dir_listing(target, "/".join(parts))
+        if os.path.isfile(target):
+            return self.send_file(target, meta)
+        return self.send_error(404)
+
+    def send_file(self, path, meta):
+        ctype = content_type(path)
+        size = os.path.getsize(path)
+        rng = parse_range(self.headers.get("Range"), size)
+        if rng is False:
+            self.send_response(416)
+            self.send_header("Content-Range", "bytes */%d" % size)
+            self.send_header("Content-Length", "0")
+            return self.end_headers()
+        start, end = rng or (0, size - 1)
+        self.send_response(206 if rng else 200)
+        self.common_headers(ctype, end - start + 1)
+        if rng:
+            self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
+        inline = ctype.startswith(INLINE_PREFIXES) or ctype.split(";")[0] in KEEP_TYPES \
+            or ctype == "application/pdf"
+        self.send_header("Content-Disposition", "%s; filename*=UTF-8''%s" % (
+            "inline" if inline else "attachment", quote(os.path.basename(path))))
+        if ctype in SANDBOX_TYPES and meta.get("sandbox", True):
+            self.send_header("Content-Security-Policy", SANDBOX_CSP)
+            # sandboxed pages have an opaque ("null") origin; let them still load
+            # module scripts and fetch() their own assets
+            self.send_header("Access-Control-Allow-Origin", "null")
+        self.end_headers()
+        if self.head:
+            return
+        try:
+            with open(path, "rb") as f:
+                f.seek(start)
+                left = end - start + 1
+                while left > 0:
+                    chunk = f.read(min(65536, left))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    left -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # client went away (e.g. seeking in a video)
+
+    def dir_listing(self, path, title):
+        try:
+            names = sorted(n for n in os.listdir(path) if not n.startswith("."))
+        except OSError:
+            return self.send_error(403)
+        entries = []
+        for n in names:
+            p = os.path.join(path, n)
+            entries.append((n + ("/" if os.path.isdir(p) else ""), quote(n) + ("/" if os.path.isdir(p) else ""), p))
+        entries.sort(key=lambda e: (not e[0].endswith("/"), e[0]))  # directories first
+        self.index_page(title + "/", [("../", "../", None)] + entries)
+
+    def index_page(self, title, entries):
+        items = []
+        for name, href, path in entries:
+            href, label = html.escape(href, quote=True), html.escape(name)
+            if path and os.path.isfile(path) and (mimetypes.guess_type(path)[0] or "").startswith("image/"):
+                items.append('<figure><a href="%s"><img src="%s" loading="lazy"></a>'
+                             '<figcaption>%s</figcaption></figure>' % (href, href, label))
+            else:
+                items.append('<p><a href="%s">%s</a></p>' % (href, label))
         body = ("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>"
-                "<title>imgshare</title><style>body{margin:16px;font:14px sans-serif;background:#111;color:#ddd}"
-                "figure{margin:0 0 24px}img{max-width:100%;display:block}</style>" + items).encode()
+                "<title>%s</title><style>body{margin:16px;font:14px sans-serif;background:#111;color:#ddd}"
+                "a{color:#8ab4f8}figure{margin:0 0 24px}img{max-width:100%%;display:block}</style>"
+                "<h3>%s</h3>%s" % (html.escape(title), html.escape(title), "\n".join(items))).encode()
         self.send_response(200)
         self.common_headers("text/html; charset=utf-8", len(body))
         self.end_headers()
-        if not head:
+        if not self.head:
             self.wfile.write(body)
 
     def common_headers(self, ctype, length):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(length))
+        self.send_header("Accept-Ranges", "bytes")
         self.send_header("Cache-Control", "private, no-store")
         self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Robots-Tag", "noindex")
 
 
@@ -233,25 +386,34 @@ def base_url():
     return "http://%s:%d" % (public_host(), PORT)
 
 
-def share(paths, ttl):
+def entry_urls(base, token, meta):
+    for name, path in meta["files"].items():
+        yield "%s/%s/%s%s" % (base, token, quote(name), "/" if os.path.isdir(path) else "")
+
+
+def share(paths, ttl, sandbox):
     files = {}
     for p in paths:
-        if not os.path.isfile(p):
-            sys.exit("File not found: %s" % p)
-        name = os.path.basename(p)
+        if not os.path.exists(p):
+            sys.exit("Not found: %s" % p)
+        real = os.path.realpath(p)
+        name = os.path.basename(real) or "root"
         stem, ext = os.path.splitext(name)
+        if name.startswith("."):  # dot-names are never served
+            name = "_" + name
         i = 1
-        while name in files:  # de-duplicate identical file names
+        while name in files:  # de-duplicate identical names
             name = "%s-%d%s" % (stem, i, ext)
             i += 1
-        files[name] = os.path.realpath(p)
+        files[name] = real
 
     token = secrets.token_urlsafe(12)
+    meta = {"expires": time.time() + ttl, "files": files, "sandbox": sandbox}
     with Lock():
         purge_expired()
         tmp = os.path.join(SHARES, token + ".tmp")
         with open(tmp, "w") as f:
-            json.dump({"expires": time.time() + ttl, "files": files}, f)
+            json.dump(meta, f)
         os.chmod(tmp, 0o600)
         os.replace(tmp, os.path.join(SHARES, token + ".json"))
         if not server_pid() and not start_server():
@@ -260,11 +422,11 @@ def share(paths, ttl):
             sys.exit("[x] Failed to start server (port %d in use?)%s" % (PORT, ("\n    " + tail[0]) if tail else ""))
 
     base = base_url()
-    for name in files:
-        print(link("%s/%s/%s" % (base, token, quote(name))))
+    for url in entry_urls(base, token, meta):
+        print(link(url))
     if len(files) > 1:
         print("All: " + link("%s/%s/" % (base, token)))
-    print("Expires at %s" % time.strftime("%H:%M", time.localtime(time.time() + ttl)), file=sys.stderr)
+    print("Expires at %s" % time.strftime("%H:%M", time.localtime(meta["expires"])), file=sys.stderr)
 
 
 def list_shares():
@@ -274,8 +436,8 @@ def list_shares():
     base = base_url()
     for token, meta in sorted(shares.items(), key=lambda kv: kv[1]["expires"]):
         print("Expires %s" % time.strftime("%m-%d %H:%M", time.localtime(meta["expires"])))
-        for name in meta["files"]:
-            print("   " + link("%s/%s/%s" % (base, token, quote(name))))
+        for url in entry_urls(base, token, meta):
+            print("   " + link(url))
 
 
 def stop():
@@ -301,12 +463,20 @@ def main():
         return list_shares()
     if args == ["-s"]:
         return stop()
-    ttl = DEFAULT_TTL
-    if args[0] == "-t":
-        if len(args) < 3:
-            sys.exit("Usage: imgshare -t 10m FILE...")
-        ttl, args = parse_ttl(args[1]), args[2:]
-    share(args, ttl)
+    ttl, sandbox = DEFAULT_TTL, True
+    while args and args[0].startswith("-"):
+        opt = args.pop(0)
+        if opt == "--":
+            break
+        elif opt == "-t" and args:
+            ttl = parse_ttl(args.pop(0))
+        elif opt == "-x":
+            sandbox = False
+        else:
+            sys.exit("Unknown option: %s (see imgshare -h)" % opt)
+    if not args:
+        sys.exit("Usage: imgshare [-t 10m] [-x] PATH...")
+    share(args, ttl, sandbox)
 
 
 if __name__ == "__main__":
