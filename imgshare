@@ -6,7 +6,8 @@ Usage:
   imgshare ./site/                   share a directory (opens its index.html, or lists it)
   imgshare -t 10m 1.png              set the lifetime (s/m/h/d)
   imgshare -x ./site/                disable the HTML sandbox (for pages that need localStorage etc.)
-  imgshare -l                        list active shares
+  imgshare -l                        list active shares (with their tokens)
+  imgshare -r TOKEN|URL ...          revoke individual shares
   imgshare -s                        stop the server and remove all shares
 
 Images, HTML, PDF, audio and video open in the browser; text files (logs, source,
@@ -435,9 +436,28 @@ def list_shares():
         return print("(no active shares)")
     base = base_url()
     for token, meta in sorted(shares.items(), key=lambda kv: kv[1]["expires"]):
-        print("Expires %s" % time.strftime("%m-%d %H:%M", time.localtime(meta["expires"])))
+        print("%s  expires %s" % (token, time.strftime("%m-%d %H:%M", time.localtime(meta["expires"]))))
         for url in entry_urls(base, token, meta):
             print("   " + link(url))
+
+
+def revoke(items):
+    failed = False
+    with Lock():
+        for item in items:
+            # accept a bare token or any link from the share
+            m = re.match(r"^(?:https?://[^/]+)?/?([A-Za-z0-9_-]+)", item)
+            token = m.group(1) if m else ""
+            path = os.path.join(SHARES, token + ".json")
+            if TOKEN_RE.match(token) and os.path.exists(path):
+                os.remove(path)
+                print("Revoked %s" % token)
+            else:
+                print("No such share: %s" % item, file=sys.stderr)
+                failed = True
+    # the server exits on its own once no shares remain
+    if failed:
+        sys.exit(1)
 
 
 def stop():
@@ -463,6 +483,10 @@ def main():
         return list_shares()
     if args == ["-s"]:
         return stop()
+    if args[0] == "-r":
+        if len(args) < 2:
+            sys.exit("Usage: imgshare -r TOKEN|URL ...")
+        return revoke(args[1:])
     ttl, sandbox = DEFAULT_TTL, True
     while args and args[0].startswith("-"):
         opt = args.pop(0)
